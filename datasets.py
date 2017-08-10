@@ -1,16 +1,12 @@
 from math import log, exp
 import numpy as np
-import pandas as pd
+
 class SimulatedData:
     def __init__(self, hr_ratio,
         average_death = 5, end_time = 15,
-        num_features = 10, num_var = 2,
+        num_features = 10, censor_p = 0.1, num_var = 2,
         treatment_group = False):
         """
-        from datasets import SimulatedData
-        s = SimulatedData(hr_ratio = 2)
-        s.generate_data(N=500)
-
         Factory class for producing simulated survival data.
         Current supports two forms of simulated data:
             Linear:
@@ -29,13 +25,13 @@ class SimulatedData:
             treatment_group: True or False. Include an additional covariate
                 representing a binary treatment group.
         """
-
         self.hr_ratio = hr_ratio
         self.end_time = end_time
         self.average_death = average_death
         self.treatment_group = treatment_group
         self.m = int(num_features) + int(treatment_group)
         self.num_var = num_var
+        self.censor_p = censor_p
 
     def _linear_H(self,x):
         """
@@ -52,6 +48,7 @@ class SimulatedData:
         b = np.zeros((self.m,))
         b[0:self.num_var] = range(1,self.num_var + 1)
 
+        # print(b)
         # Linear Combinations of Coefficients and Covariates
         risk = np.dot(x, b)
         return risk
@@ -79,7 +76,7 @@ class SimulatedData:
         risk = max_hr * (np.exp(-(z) / (2 * rad ** 2)))
         return risk
 
-    def generate_data(self, N,
+    def generate_data(self, N, 
         method = 'gaussian', gaussian_config = {},
         **kwargs):
         """
@@ -110,7 +107,7 @@ class SimulatedData:
 
         if self.treatment_group:
             data[:,-1] = np.squeeze(np.random.randint(0,2,(N,1)))
-            print(data[:,-1])
+            print (data[:,-1])
 
         # Each patient has a uniform death probability
         p_death = self.average_death * np.ones((N,1))
@@ -125,7 +122,7 @@ class SimulatedData:
 
         elif method == 'gaussian':
             risk = self._gaussian_H(data,**gaussian_config)
-
+        
         # Center the hazard ratio so population dies at the same rate
         # independent of control group (makes the problem easier)
         risk = risk - np.mean(risk)
@@ -144,17 +141,22 @@ class SimulatedData:
         death_time[death_time > self.end_time] = self.end_time
         censoring[death_time == self.end_time] = 0
 
+        # Censor by percentage
+        idx=np.where(censoring==0)
+        censoring_flag=np.random.rand(N,1)
+        censoring_flag[idx]=0.0
+        censoring[censoring_flag<=np.percentile(censoring_flag,self.censor_p*100)]=0
+
+
         # Flatten Arrays to Vectors
         death_time = np.squeeze(death_time)
         censoring = np.squeeze(censoring)
 
-        dataset = pd.DataFrame({
-            #only one column of x was used for simplicity
-            'x' : data[:,0].astype(np.float32),
+        dataset = {
+            'x' : data.astype(np.float32),
             'e' : censoring.astype(np.int32),
             't' : death_time.astype(np.float32),
             'hr' : risk.astype(np.float32)
-        })
-        dataset.to_csv("simulated_dat.csv",index = False)
+        }
 
         return dataset
