@@ -6,6 +6,7 @@ from lifelines.utils import concordance_index
 import numpy
 import matplotlib.pyplot as plt
 import pdb
+import datasets
 
 
 class Parameters(object):
@@ -27,13 +28,18 @@ class Parameters(object):
 		self.batch_norm = False
 		self.standardize = False
 		self.batch_norm_epsilon = 0.00001 ## numerical stability
+		self.random_seed=1
 
 		##training params
 		self.n_epochs = 500 ## no batches, only epochs since loss requires complete data to calculate
 		self.modelPath = "out/learned.model" ## path to save the model, so that it can be restored later for use
+		self.graphPath = "graph/model.graphs" ## path to save the model, so that it can be restored later for use
 		self.patience = 1000
 		self.improvement_threshold = 0.99999
 		self.patience_increase = 2
+		self.save_model=False
+		self.displayCI=False
+		self.save_n_model=self.n_epochs
 
 		##
 		self.summaryPlots = None
@@ -42,8 +48,8 @@ class Parameters(object):
 class DeepSurvTF(object):
 	def __init__(self, params):
 		self.params = params
-		x = tf.placeholder(dtype = tf.float32, shape = [None, self.params.n_in])
-		e = tf.placeholder(dtype = tf.float32)
+		x = tf.placeholder(dtype = tf.float32, shape = [None, self.params.n_in],name="x")
+		e = tf.placeholder(dtype = tf.float32,name="e")
 		
 		assert (self.params.hidden_layers_sizes is not None \
 			and type(self.params.hidden_layers_sizes) == list), \
@@ -56,11 +62,12 @@ class DeepSurvTF(object):
 		self.trainingStats = {}
 
 		out = x
+
 		in_size = self.params.n_in
 
 
 		for i in self.params.hidden_layers_sizes:
-			weights = tf.Variable(tf.truncated_normal((in_size, i)),dtype = tf.float32)
+			weights = tf.Variable(tf.truncated_normal((in_size, i), seed = self.params.random_seed),dtype = tf.float32,name="weights")
 			weightsList.append(weights)
 
 			out = tf.matmul(out, weights)
@@ -68,11 +75,13 @@ class DeepSurvTF(object):
 			if self.params.batch_norm: ##TODO : check if ewma needs to be there for non CNN type layers
 				batch_mean1, batch_var1 = tf.nn.moments(out,[0])
 				out_hat = (out - batch_mean1) / tf.sqrt(batch_var1 + self.params.batch_norm_epsilon)
-				scale = tf.Variable(tf.ones(i))
-				beta = tf.Variable(tf.zeros(i))
+				scale = tf.Variable(tf.ones(i),name="scale")
+				beta = tf.Variable(tf.zeros(i),name="beta")
 				out = scale * out_hat + beta
+#				out=tf.nn.batch_normalization(out,batch_mean1,batch_var1,beta,scale,self.params.batch_norm_epsilon)
+
 			else:
-				bias = tf.Variable(tf.zeros(i), dtype = tf.float32)
+				bias = tf.Variable(tf.zeros(i), dtype = tf.float32,name="bias")
 				out = out + bias
 
 			out = self.params.activation(out)
@@ -81,19 +90,22 @@ class DeepSurvTF(object):
 
 			in_size = i
 
+		##assign a name to the output of the last hidden layer for transfer learning                
+		LastHiddenLayerOutput=tf.identity(out,name="LastHiddenLayerOutput")
+        
 		##final output linear layer with single output
-		weights = tf.Variable(tf.truncated_normal((in_size, 1)),dtype = tf.float32)
-		bias = tf.Variable(tf.zeros(1), dtype = tf.float32)
-		out = tf.matmul(out, weights) + bias
+		finalweights = tf.Variable(tf.truncated_normal((in_size, 1), seed = self.params.random_seed), dtype = tf.float32, name="finalweights")
+		finalbias = tf.Variable(tf.zeros(1), dtype = tf.float32,name="finalbias")
+		out = tf.matmul(out, finalweights) + finalbias
 
 		##flattening
-		out = tf.reshape(out, [-1])
+		Output = tf.reshape(out, [-1],name="Output")
 
 		##loss
 		##assuming the inputs are sorted reverse time
-		hazard_ratio = tf.exp(out)
+		hazard_ratio = tf.exp(Output)
 		log_risk = tf.log(tf.cumsum(hazard_ratio))
-		uncensored_likelihood = out - log_risk
+		uncensored_likelihood = Output - log_risk
 		censored_likelihood = uncensored_likelihood * e
 		loss = -tf.reduce_sum(censored_likelihood)
 
@@ -105,10 +117,11 @@ class DeepSurvTF(object):
 
 		if self.params.L2_reg> 0:
 			for kk in weightsList:
+				kk=tf.clip_by_norm(kk,clip_norm=100,axes=0)
 				loss += self.params.L2_reg * tf.nn.l2_loss(kk)
 		
 		##optimiser
-		##momentum with decay
+		#momentum with decay
 		global_step = tf.Variable(0, trainable=False)
 		learning_rate = tf.train.inverse_time_decay(
 			learning_rate = self.params.learning_rate, 
@@ -116,6 +129,7 @@ class DeepSurvTF(object):
 			decay_steps = 1, 
 			decay_rate = self.params.lr_decay, 
 		)
+
 		grad_step = (
     		tf.train.MomentumOptimizer(learning_rate, momentum = self.params.momentum, use_nesterov =True)
     		.minimize(loss, global_step=global_step)
@@ -129,12 +143,22 @@ class DeepSurvTF(object):
 		# grad_step = tf.train.GradientDescentOptimizer(learning_rate = self.params.learning_rate)\
 					# .minimize(loss)
 
+		##gradient descent with max-norm
+		#grad_step = tf.train.GradientDescentOptimizer(learning_rate = self.params.learning_rate)
+		# Compute the gradients for a list of variables.
+		#grads_and_vars = grad_step.compute_gradients(loss, weights)
+		# grads_and_vars is a list of tuples (gradient, variable).
+		# Do whatever you need to the 'gradient' part, for example cap them, etc.
+		#capped_grads_and_vars = [(tf.clip_by_norm(gv[0], clip_norm=20.0, axes=0), gv[1]) for gv in grads_and_vars]
+		# Ask the optimizer to apply the capped gradients
+		#grad_step = grad_step.apply_gradients(capped_grads_and_vars)
+        
 		##input handles
 		self.x = x
 		self.e = e
 
 		##metrics to retrieve later
-		self.risk = out
+		self.risk = Output
 		self.grad_step = grad_step
 		self.loss = loss
 			
@@ -172,6 +196,7 @@ class DeepSurvTF(object):
 		best_params_idx = -1
 
 		with tf.Session() as sess:
+			tf.set_random_seed(self.params.random_seed)
 			sess.run(tf.global_variables_initializer()) ##init graph with given initializers
 			##start training
 			for epoch in range(self.params.n_epochs):
@@ -183,6 +208,7 @@ class DeepSurvTF(object):
 					})
 				
 				train_losses.append(loss)
+
 				train_ci.append(concordance_index(tdata, -numpy.exp(risk.ravel()), edata))
 				train_index.append(epoch)
 
@@ -199,6 +225,9 @@ class DeepSurvTF(object):
 					validation_ci.append(concordance_index(tdata_valid, -numpy.exp(vrisk.ravel()), edata_valid))                 
 					validation_index.append(epoch)
 
+					if self.params.displayCI:
+						print("Epoch:",epoch,"\tTraining CI:", concordance_index(tdata, -numpy.exp(risk.ravel()), edata), "\tValidation CI:",concordance_index(tdata_valid, -numpy.exp(vrisk.ravel()), edata_valid))
+
 					# improve patience if loss improves enough
 					if vloss < best_validation_loss * self.params.improvement_threshold:
 						self.params.patience = max(self.params.patience, epoch * self.params.patience_increase)
@@ -209,14 +238,22 @@ class DeepSurvTF(object):
 				if self.params.patience <= epoch:
 					break
 
-			print("Training done")
-			print("Best epoch", best_params_idx)
-			print("Best loss", best_validation_loss)
+				##save model
+				if (self.params.save_model and epoch== self.params.save_n_model):
+					saver = tf.train.Saver()
+					saver.save(sess, self.params.modelPath+"-"+str(epoch)+"/"+"model")
+
+#			print("Training done")
+#			print("Best epoch", best_params_idx)
+#			print("Best loss", best_validation_loss)
 
 			##save model
-			saver = tf.train.Saver()
-			saver.save(sess, self.params.modelPath)
+#			if (self.params.save_model):
+#				saver = tf.train.Saver()
+#				saver.save(sess, self.params.modelPath+"-"+str(epoch)+"/"+"model")
 
+			#Save graphs
+#			writer.close()
 			self.trainingStats["training"] = {
 				"loss" : train_losses,
 				"ci" : train_ci,
@@ -240,20 +277,20 @@ class DeepSurvTF(object):
 		##plot losses
 		fig, [ax1, ax2] = plt.subplots(figsize = (15,6), nrows=1, ncols=2 )  # create figure & 1 axis
 		##losses of train and validation
-		ax1.plot(self.trainingStats["training"]["epochs"], self.trainingStats["training"]["loss"], "ro")
+#		ax1.plot(self.trainingStats["training"]["epochs"], self.trainingStats["training"]["loss"], "ro")
 		l1, = ax1.plot(self.trainingStats["training"]["epochs"], self.trainingStats["training"]["loss"], "r")
 		if validationData:
-			ax1.plot(self.trainingStats["validation"]["epochs"], self.trainingStats["validation"]["loss"], "bo")
+#			ax1.plot(self.trainingStats["validation"]["epochs"], self.trainingStats["validation"]["loss"], "bo")
 			l2, = ax1.plot(self.trainingStats["validation"]["epochs"], self.trainingStats["validation"]["loss"], "b")
 		ax1.set_xlabel("Epochs")
 		ax1.set_ylabel("Loss")
 		ax1.grid()
 
 		##ci of train and validation
-		ax2.plot(self.trainingStats["training"]["epochs"], self.trainingStats["training"]["ci"], "ro")
+#		ax2.plot(self.trainingStats["training"]["epochs"], self.trainingStats["training"]["ci"], "ro")
 		ax2.plot(self.trainingStats["training"]["epochs"], self.trainingStats["training"]["ci"], "r")
 		if validationData:
-			ax2.plot(self.trainingStats["validation"]["epochs"], self.trainingStats["validation"]["ci"], "bo")
+#			ax2.plot(self.trainingStats["validation"]["epochs"], self.trainingStats["validation"]["ci"], "bo")
 			ax2.plot(self.trainingStats["validation"]["epochs"], self.trainingStats["validation"]["ci"], "b")
 		ax2.set_xlabel("Epochs")
 		ax2.set_ylabel("CI")
@@ -269,10 +306,11 @@ class DeepSurvTF(object):
 			plt.show()
 
 	def predict(self, testXdata):
-		assert os.path.exists(self.params.modelPath)
+#		print(os.path.dirname(self.params.modelPath))
+		assert os.path.exists(os.path.dirname(self.params.modelPath))
 		with tf.Session() as sess:
 			saver = tf.train.Saver()
-			saver.restore(sess, self.params.modelPath)
+			saver.restore(sess, self.params.modelPath)           
 			print("model loaded")
 
 			risk = sess.run([risk], feed_dict = {self.x : testXdata})
